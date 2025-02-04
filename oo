@@ -1,0 +1,817 @@
+#!/usr/bin/env sh
+# vi: ft=sh
+
+# Configurable variables
+#
+virsh="virsh"
+remoteUser="${USER}"
+sshPubKeyFile="${HOME}/.ssh/id_ed25519.pub"
+X11Flags="-X -Y"
+
+VERSION()
+{
+    cat >&2 <<_TEXT_
+HomeRunOS 0.1.0
+_TEXT_
+}
+
+_ERROR()
+{
+    if [ -t 2 ]; then
+        printf "%s\\n" "${1}" >&2
+    elif command -v kdialog >/dev/null 2>&1; then
+        kdialog --title "HomeRunOS ERROR" --passivepopup "${1}" 5
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send "${1}"
+    fi
+}
+
+_USAGE()
+{
+    cat >&2 <<_TEXT_
+Usage:
+    oo vm-ls [--all]
+        List all running VMs.
+        If --all is provided also list all non running VMs with status
+
+    oo vm-new vm-to-clone new-vm-name
+        Clone existing VM into new VM.
+        Sets the hostname of the new VM to the same as provided new-vm-name.
+
+    oo vm-up vm-name
+        Start given VM (if not already running)
+
+    oo vm-down vm-name
+        Shutdown given VM if running.
+
+    oo vm-delete vm-name [--remove-all-storage]
+        Totally delete a VM and optionally also all its resources.
+        The VM must be shutdown first.
+
+    oo vm-resize vm-name new-size-gb
+        Resize existing cow2 image of VM into given size.
+        VM must be shutdown first.
+
+    oo wopen vm-name command [args]
+        Open a Wayland application in VM given by "vm-name" with optional [args]
+        Commands are run over SSH using waypipe both on server and client.
+        Fallback on X11.
+
+    oo xopen vm-name command [args]
+        Open an X11 application in VM given by "vm-name" with optional [args]
+        Commands are run over SSH with X11 forwarding enabled.
+
+    oo ssh vm-name [ssh-args] [command] [args]
+        Open SSH shell in VM or execute command in VM over SSH.
+        By default not opened with X11 forwarding enabled.
+        To run with X11 forwarding: oo ssh vm -X konsole --profile "hackster"
+
+    oo cp source-vm /path/to/copy dest-vm /local/dest/path
+        Copy files between two VMs.
+        Files are copied recursively.
+        The copy action must be approved by dom0 and is performed from dom0.
+        This command can be invoked from inside a VM by using the "oocp", which
+        requires that the copy tunnel is active (which it normally is).
+
+    oo mktunnel tunnel-vm
+        Setup a copy tunnel so to-vm-name can issue the "oocp" command to copy files from other VMs.
+        The tunnel is normally auto setup when the VM is started and does not have to be invoked manually.
+
+    oo rmtunnel tunnel-vm
+        Tear down the tunnel from the VM to dom0, if it is up.
+
+    oo ip vm-name
+        Print given VMs local IP address to stdout.
+
+    oo upload local-path vm-name remote-dest-path
+        Copy files recursively from dom0 to VM.
+
+    oo download vm-name remote-source-path local-dest-path
+        Copy files recursively from VM into dom0.
+
+    oo usb-attach [vendorId:productId] [vm-name]
+        Attach USB device to VM.
+        If any argument is left out a dialog will show.
+
+    oo [-h | help]
+        Show this help.
+
+    oo [-V | version]
+        Show current version of HomeRunOS.
+_TEXT_
+}
+
+_SCP()
+{
+    local srcVm="${1}"
+    shift
+
+    local srcPath="${1}"
+    shift
+
+    local destVm="${1}"
+    shift
+
+    local destPath="${1}"
+    shift
+
+    local srcIP=
+    srcIP=$(_IP "${srcVm}")
+
+    if [ "$?" -gt 0 ]; then
+        return 1
+    fi
+
+    local destIP=
+    destIP=$(_IP "${destVm}")
+
+    if [ "$?" -gt 0 ]; then
+        return 1
+    fi
+
+    if ! command -v scp >/dev/null 2>&1; then
+        _ERROR "Error: scp command missing"
+        return 1
+    fi
+
+    scp -3r "scp://${remoteUser}@${srcIP}/${srcPath}" "scp://${remoteUser}@${destIP}/${destPath}"
+}
+
+_UPLOAD()
+{
+    local localPath="${1}"
+    shift
+
+    local destVm="${1}"
+    shift
+
+    local destPath="${1}"
+    shift
+
+    local destIP=
+    destIP=$(_IP "${destVm}")
+
+    if [ "$?" -gt 0 ]; then
+        return 1
+    fi
+
+    scp -r "${localPath}" "scp://${remoteUser}@${destIP}/${destPath}"
+}
+
+_DOWNLOAD()
+{
+    local sourceVm="${1}"
+    shift
+
+    local remotePath="${1}"
+    shift
+
+    local destPath="${1}"
+    shift
+
+    local sourceIP=
+    sourceIP=$(_IP "${sourceVm}")
+
+    if [ "$?" -gt 0 ]; then
+        return 1
+    fi
+
+    scp -r "scp://${remoteUser}@${sourceIP}/${remotePath}" "${remotePath}"
+}
+
+_IP()
+{
+    $(_VM_MUST_EXIST "${1}" >/dev/null 2>&1)
+
+    if [ "$?" -gt 0 ]; then
+        return 1
+    fi
+
+    if ! _VM_RUNNING "${1}"; then
+        _ERROR "Error: ${1} is not running"
+        return 1
+    fi
+
+    ${virsh} domifaddr "${1}" | grep -E -o "([0-9]{1,3}[\.]){3}[0-9]{1,3}"
+}
+
+_USB_ATTACH()
+{
+    local device="${1:-}"
+    local vmName="${2:-}"
+
+    local devices=$(lsusb)
+    local s=""
+    s=$(lsusb | {
+        while IFS= read -r line; do
+            name="${line#*ID }"
+            device="${name%% *}"
+            printf "%s" "${device} \"${name}\" off "
+        done; }
+        echo
+    )
+
+    if [ -z "${device}" ]; then
+        local cmd="kdialog --title \"Choose USB device\" --radiolist \"Available USB devices\" ${s}"
+
+        # TODO:
+        device=$(eval "$cmd")
+
+        if [ "$?" -gt 0 ]; then
+            exit 1
+        fi
+    fi
+
+    if [ -z "${vmName}" ]; then
+        # TODO
+        :
+    fi
+
+    local vendorId="${device%%:*}"
+    local productId="${device##*:}"
+
+    printf "%s : %s \\n" "$vendorId" "$productId"
+
+    exit 3
+
+    printf "%s\\n" | virsh attach-device "${vmName}" --file /dev/stdin --current << _HOMERUN_
+<hostdev mode='subsystem' type='usb' managed='yes'>
+    <source>
+        <vendor id='0x${vendorId}'/>
+        <product id='0x${productId}'/>
+    </source>
+</hostdev>
+_HOMERUN_
+}
+
+_NOTIFY()
+{
+    if [ -t 2 ]; then
+        printf "%s\\n" "${1}" >&2
+    elif command -v kdialog >/dev/null 2>&1; then
+        kdialog --title "HomeRunOS" --passivepopup "${1}" 5
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send "${1}"
+    fi
+}
+
+_VM_MUST_EXIST()
+{
+    ${virsh} dominfo "${1}" >/dev/null 2>/dev/null
+
+    if [ $? -gt 0 ]; then
+        _ERROR "Error: ${1} does not exist"
+        return 1
+    fi
+}
+
+_VM_RUNNING()
+{
+    ${virsh} domstate "${1}" | grep -q running
+}
+
+_SHUTDOWN()
+{
+    local vmName="${1}"
+    shift
+
+    _VM_MUST_EXIST "${vmName}" || return 1
+
+    if _VM_RUNNING "${vmName}"; then
+        _RMTUNNEL "${vmName}"
+        ${virsh} shutdown "${vmName}" >/dev/null
+        _NOTIFY "${vmName} shutdown"
+    fi
+}
+
+_DELETE()
+{
+    local vmName="${1}"
+    shift
+
+    _VM_MUST_EXIST "${vmName}" || return 1
+
+    if _VM_RUNNING "${vmName}"; then
+        _ERROR "Error: VM must first be shutdown before deleted"
+        return 1
+    fi
+
+    virsh undefine "${vmName}" "${@}"
+}
+
+_START()
+{
+    local vmName="${1}"
+    shift
+
+    _VM_MUST_EXIST "${vmName}" || return 1
+
+    if ! _VM_RUNNING "${vmName}"; then
+        _NOTIFY "Starting ${vmName}"
+
+        ${virsh} start "${vmName}" >/dev/null
+
+        sleep 3
+
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            local IP=
+            IP=$(_IP "${vmName}")
+
+            if [ "$?" -gt 0 ]; then
+                sleep 3
+                continue
+            fi
+
+            ssh "${remoteUser}@${IP}" hostname >/dev/null 2>&1
+
+            if [ $? -eq 0 ]; then
+                _NOTIFY "${vmName} started"
+
+                ${0} mktunnel "${vmName}"
+
+                return
+            fi
+
+            sleep 3
+        done
+
+        _ERROR "${vmName} could not start"
+
+        return 1
+    fi
+}
+
+socat_pid=
+ssh_pid=
+# Setup ssh reverse tunnel from guest VM to dom0
+#
+_MKTUNNEL()
+{
+    local tunnelVM="${1}"
+    shift
+
+    local IP=
+    IP=$(_IP "${tunnelVM}")
+
+    if [ "$?" -gt 0 ]; then
+        return 1
+    fi
+
+    local localSocket="${HOME}/homerunos-${tunnelVM}.sock"
+    local remoteSocket="/home/${remoteUser}/homerunos.sock"
+    local pidFile="/tmp/homerunos-${tunnelVM}.pid"
+
+    rm -f "${localSocket}"
+
+    ssh "${remoteUser}@${IP}" rm -f "${remoteSocket}"
+
+    socat "unix-listen:${localSocket},reuseaddr,retry,fork" exec:"${0} tunnelfork ${tunnelVM}" 2>/dev/null &
+
+    socat_pid="$!"
+
+    trap _TRAP TERM INT HUP
+
+    printf "%s\\n" "$$" >"${pidFile}"
+
+    ssh -o StreamLocalBindUnlink=yes -R "${remoteSocket}:${localSocket}" "${remoteUser}@${IP}" tail -f /dev/null >/dev/null 2>&1 &
+
+    ssh_pid="$!"
+
+    wait ${socat_pid} ${ssh_pid}
+
+    exit 1
+}
+
+_TRAP()
+{
+    kill -s HUP "${socat_pid}" "${ssh_pid}" 2>/dev/null
+
+    exit 1
+}
+
+# Plumbing command
+#
+_TUNNELFORK()
+{
+    local tunnelVM="${1}"
+    shift
+
+    local command=""
+    IFS= read -r command
+
+    if [ "${command}" != "cp" ]; then
+        printf "error: %d\\n" "2"
+        return 1
+    fi
+
+    local sourceVM=""
+    IFS= read -r sourceVM
+
+    local sourcePath=""
+    IFS= read -r sourcePath
+
+    local tunnelVMPath=""
+    IFS= read -r tunnelVMPath
+
+    # Close stdin as it is unix socket and kdialog reacts to this.
+    #
+    exec 0<&-
+
+    # TODO: consider separating stout and stderr
+    ${0} "cp" "${sourceVM}" "${sourcePath}" "${tunnelVM}" "${tunnelVMPath}" 2>&1
+
+    err="$?"
+
+    printf "error: %d\\n" "${err}"
+}
+
+_RMTUNNEL()
+{
+    local tunnelVM="${1}"
+    shift
+
+    local pidFile="/tmp/homerunos-${tunnelVM}.pid"
+
+    if [ -O "${pidFile}" ]; then
+        kill -s HUP $(cat "${pidFile}")
+        rm "${pidFile}"
+    fi
+}
+
+_LS()
+{
+    local all="${1}"
+    shift
+
+    ${virsh} list ${all} | awk 'NR>2 && NF>0 {print $2}'
+}
+
+_RUNX()
+{
+    local vmName="${1}"
+    shift
+
+    local app="${1}"
+    shift
+
+    if ! _VM_RUNNING "${vmName}"; then
+        _ERROR "Error: ${vmName} is not running"
+        return 1
+    fi
+
+    local IP=
+    IP=$(_IP "${vmName}")
+
+    if [ "$?" -gt 0 ]; then
+        return 1
+    fi
+
+    ssh ${X11Flags} "${remoteUser}@${IP}" "${app}" "$@"
+}
+
+_RUNW()
+{
+    local vmName="${1}"
+    shift
+
+    local app="${1}"
+    shift
+
+    if ! _VM_RUNNING "${vmName}"; then
+        _ERROR "Error: ${vmName} is not running"
+        return 1
+    fi
+
+    local IP=
+    IP=$(_IP "${vmName}")
+
+    if [ "$?" -gt 0 ]; then
+        return 1
+    fi
+
+    waypipe ssh ${X11Flags} "${remoteUser}@${IP}" "${app}" "$@"
+}
+
+_SSH()
+{
+    local vmName="${1}"
+    shift
+
+    local IP=
+    IP=$(_IP "${vmName}")
+
+    if [ "$?" -gt 0 ]; then
+        return 1
+    fi
+
+    ssh "${remoteUser}@${IP}" "$@"
+}
+
+_CLONE()
+{
+    local tpl="${1}"
+    shift
+
+    local vmName="${1}"
+    shift
+
+    _ERROR "Cloning ${tpl}..."
+
+    virt-clone --original "${tpl}" --name "${vmName}" --auto-clone
+
+    if [ "$?" -gt 0 ]; then
+        _ERROR "Error: Could not clone ${tpl}"
+        return 1
+    fi
+
+    # NOTE: seems as this still has to be run with sudo to work.
+    #
+    sudo virt-sysprep -d "${vmName}" --hostname "${vmName}" --ssh-inject "${remoteUser}:file:${sshPubKeyFile}" --firstboot-command "dpkg-reconfigure openssh-server"
+
+    if [ "$?" -gt 0 ]; then
+        _ERROR "Error: Could not prep cloned VM ${vmName}"
+        return 1
+    fi
+
+    _START "${vmName}" || return 1
+
+    _NOTIFY "Attempting to connect to ${vmName} via SSH..."
+
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        local IP=
+        IP=$(_IP "${vmName}")
+
+        if [ -z "${IP}" ]; then
+            sleep 3
+            continue
+        fi
+
+        ssh -o StrictHostKeyChecking=accept-new "${remoteUser}@${IP}" hostname >/dev/null
+
+        if [ $? -eq 0 ]; then
+            _ERROR "SSH'ing into the new VM failed. Possibly a confligt in known_hosts. Fix that then run: oo ssh ${vmName}"
+            return
+        fi
+
+        sleep 3
+    done
+
+    _ERROR "Could not SSH into newly cloned VM ${vmName}"
+}
+
+if [ "$(id -u)" = "0" ]; then
+    _ERROR "oo cannot be run as root"
+    exit 1
+fi
+
+if [ "$#" -eq 0 ]; then
+    _USAGE
+    exit 1
+fi
+
+command="${1}"
+shift
+
+if [ "${command}" = "vm-ls" ]; then
+    all=""
+
+    if [ "$#" -gt 0 ]; then
+        all="${1}"
+
+        if [ "${all}" != "--all" ]; then
+            _ERROR "Error: If second argument provided it must be --all (or nothing)"
+            exit 1
+        fi
+    fi
+
+    _LS "${all}"
+
+elif [ "${command}" = "vm-new" ]; then
+    if [ "$#" -ne 2 ]; then
+        _ERROR "Error: vm-new command takes exactly two arguments: template-vm-name new-vm-name"
+        exit 1
+    fi
+
+    _CLONE "${1}" "${2}"
+
+elif [ "${command}" = "vm-up" ]; then
+    if [ "$#" -ne 1 ]; then
+        _ERROR "Error: vm-up command takes exactly one argument: vm-name"
+        exit 1
+    fi
+
+    _START "${1}"
+
+elif [ "${command}" = "vm-down" ]; then
+    if [ "$#" -ne 1 ]; then
+        _ERROR "Error: vm-down command takes exactly one argument: vm-name"
+        exit 1
+    fi
+
+    _SHUTDOWN "${1}"
+
+elif [ "${command}" = "vm-delete" ]; then
+    if [ "$#" -ne 1 ] && [ "$#" -ne 2 ]; then
+        _ERROR "Error: vm-delete command takes one or two arguments: vm-name [--remove-all-storage]"
+        exit 1
+    fi
+
+    if [ ! -t 2 ]; then
+        # Must be run from cmd line
+        _ERROR "vm-delete must be run from command line"
+        exit 1
+    fi
+
+    all=""
+    if [ "$#" -eq 2 ]; then
+        all="${2}"
+
+        if [ "${all}" != "--remove-all-storage" ]; then
+            _ERROR "Error: vm-delete command takes one or two arguments: vm-name [--remove-all-storage]"
+            exit 1
+        fi
+    fi
+
+    printf "Will delete VM %s in 3 seconds... Press CTRL-C to abort\\n" "${1}" >&2
+
+    sleep 3
+
+    _DELETE "${1}" "${all}"
+
+elif [ "${command}" = vm-"resize" ]; then
+    cat >&2 <<_TEXT_
+vm-resize not automated, but do the following to do it manually:
+
+# Shut down VM
+#
+oo vm-down vm-name
+
+# Find out where the VMs qcow2 image file is
+#
+virsh dominfo vm-name
+
+# Then do:
+#
+sudo mv /var/lib/libvirt/images/img.qcow2 ~/img.qcow2.old
+
+# Take note of partition to expand
+#
+sudo virt-filesystems -a ~/img.qcow2.old --all --long -h
+
+# Create new image file with desired size
+#
+sudo qemu-img create -f qcow2 /var/lib/libvirt/images/img.qcow2 40G
+
+# In partition is /dev/sda1
+#
+sudo virt-resize --expand /dev/sda1 ~/img.qcow2.old /var/lib/libvirt/images/img.qcow2
+
+_TEXT_
+
+    exit 1
+
+elif [ "${command}" = "xopen" ]; then
+    if [ "$#" -lt 2 ]; then
+        _ERROR "Error: xopen command takes at least two arguments: vm-name executable [args]"
+        exit 1
+    fi
+
+    vmName="${1}"
+    shift
+
+    app="${1}"
+    shift
+
+    _START "${vmName}" || exit 1
+
+    _RUNX "${vmName}" "${app}" "$@"
+
+elif [ "${command}" = "wopen" ]; then
+    if [ "$#" -lt 2 ]; then
+        _ERROR "Error: wopen command takes at least two arguments: vm-name executable [args]"
+        exit 1
+    fi
+
+    vmName="${1}"
+    shift
+
+    app="${1}"
+    shift
+
+    _START "${vmName}" || exit 1
+
+    _RUNW "${vmName}" "${app}" "$@"
+
+elif [ "${command}" = "ssh" ]; then
+    if [ "$#" -lt 1 ]; then
+        _ERROR "Error: ssh command takes at least one argument: vm-name [ssh-flags] [executable] [args]"
+        exit 1
+    fi
+
+    vmName="${1}"
+    shift
+
+    _START "${vmName}" || exit 1
+
+    _SSH "${vmName}" "$@"
+
+elif [ "${command}" = "cp" ]; then
+    if [ "$#" -lt 4 ]; then
+        _ERROR "Error: cp command takes four arguments: source-vm /path-to-copy/ dest-vm /dest-path/"
+        exit 1
+    fi
+
+    a=$(kdialog --title "Allow copy?" --radiolist "Allow '${3}' to copy from ${1}:${2}" 1 Cancel on 2 Allow off)
+
+    if [ "$?" -gt 0 ] || [ "${a}" != "2" ]; then
+        exit 1
+    fi
+
+    _SCP "$@"
+
+elif [ "${command}" = "mktunnel" ]; then
+    if [ "$#" -lt 1 ]; then
+        _ERROR "Error: mktunnel command takes one argument: tunnel-vm"
+        exit 1
+    fi
+
+    pidFile="/tmp/homerunos-${1}.pid"
+
+    if [ -O "${pidFile}" ] && kill -0 $(cat "${pidFile}") 2>/dev/null; then
+        _ERROR "Tunnel already exists"
+        exit 1
+    fi
+
+    nohup ${0} mktunnelbg "${1}" >/dev/null 2>&1 &
+
+elif [ "${command}" = "mktunnelbg" ]; then
+    if [ "$#" -lt 1 ]; then
+        _ERROR "Error: mktunnelbg command takes one argument: tunnel-vm"
+        exit 1
+    fi
+
+    _MKTUNNEL "${1}"
+
+elif [ "${command}" = "rmtunnel" ]; then
+    if [ "$#" -lt 1 ]; then
+        _ERROR "Error: rmtunnel command takes one argument: tunnel-vm"
+        exit 1
+    fi
+
+    _RMTUNNEL "${1}"
+
+    if [ "$?" -gt 0 ]; then
+        _ERROR "No existing tunnel\\n" >&2
+        exit 1
+    fi
+
+elif [ "${command}" = "tunnelfork" ]; then
+    if [ "$#" -lt 1 ]; then
+        _ERROR "Error: tunnelfork command takes one argument: to-vm-name"
+        exit 1
+    fi
+
+    _TUNNELFORK "$@"
+
+elif [ "${command}" = "upload" ]; then
+    if [ "$#" -lt 3 ]; then
+        _ERROR "Error: upload command takes three arguments: local-path vm-name dest-path"
+        exit 1
+    fi
+
+    _UPLOAD "$@"
+
+elif [ "${command}" = "download" ]; then
+    if [ "$#" -lt 3 ]; then
+        _ERROR "Error: download command takes three arguments: vm-name remote-source-path local-dest-path"
+        exit 1
+    fi
+
+    _DOWNLOAD "$@"
+
+elif [ "${command}" = "usb-attach" ]; then
+    _ERROR "Error: usb not implemented. Manege it directly from virt-manager"
+    exit 3
+    #_USB_ATTACH "$@"
+
+elif [ "${command}" = "ip" ]; then
+    if [ "$#" -lt 1 ]; then
+        _ERROR "Error: ip command takes one argument: vm-name"
+        exit 1
+    fi
+
+    vmName="${1}"
+    shift
+
+    _START "${vmName}" || exit 1
+
+    _IP "${vmName}"
+
+elif [ "${command}" = "help" ] || [ "${command}" = "-h" ]; then
+    _USAGE
+
+else
+    _USAGE
+
+    exit 1
+fi

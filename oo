@@ -176,7 +176,7 @@ _DOWNLOAD()
         return 1
     fi
 
-    scp -r "scp://${remoteUser}@${sourceIP}/${remotePath}" "${remotePath}"
+    scp -r "scp://${remoteUser}@${sourceIP}/${remotePath}" "${destPath}"
 }
 
 _IP()

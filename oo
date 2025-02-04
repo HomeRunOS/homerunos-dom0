@@ -15,6 +15,17 @@ HomeRunOS 0.1.0
 _TEXT_
 }
 
+_NOTIFY()
+{
+    if [ -t 2 ]; then
+        printf "%s\\n" "${1}" >&2
+    elif command -v kdialog >/dev/null 2>&1; then
+        kdialog --title "HomeRunOS" --passivepopup "${1}" 5
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send "${1}"
+    fi
+}
+
 _ERROR()
 {
     if [ -t 2 ]; then
@@ -101,6 +112,7 @@ Usage:
 _TEXT_
 }
 
+scp_pid=
 _SCP()
 {
     local srcVm="${1}"
@@ -134,7 +146,28 @@ _SCP()
         return 1
     fi
 
-    scp -3r "scp://${remoteUser}@${srcIP}/${srcPath}" "scp://${remoteUser}@${destIP}/${destPath}"
+    local size=
+
+    if ! size=$(ssh "${remoteUser}@${srcIP}" du -s "${srcPath}" | awk '{print $1}') 2>/dev/null; then
+        size=0
+    fi
+
+    printf "%d\\n" "${size}"
+
+    trap _TRAP_SCP TERM INT HUP
+
+    scp -3r "scp://${remoteUser}@${srcIP}/${srcPath}" "scp://${remoteUser}@${destIP}/${destPath}" &
+
+    scp_pid="$!"
+
+    wait "${scp_pid}"
+}
+
+_TRAP_SCP()
+{
+    kill -s HUP "${scp_pid}" 2>/dev/null
+
+    exit 1
 }
 
 _UPLOAD()
@@ -208,7 +241,7 @@ _USB_ATTACH()
             device="${name%% *}"
             printf "%s" "${device} \"${name}\" off "
         done; }
-        echo
+        printf "\\n"
     )
 
     if [ -z "${device}" ]; then
@@ -242,17 +275,6 @@ _USB_ATTACH()
     </source>
 </hostdev>
 _HOMERUN_
-}
-
-_NOTIFY()
-{
-    if [ -t 2 ]; then
-        printf "%s\\n" "${1}" >&2
-    elif command -v kdialog >/dev/null 2>&1; then
-        kdialog --title "HomeRunOS" --passivepopup "${1}" 5
-    elif command -v notify-send >/dev/null 2>&1; then
-        notify-send "${1}"
-    fi
 }
 
 _VM_MUST_EXIST()
@@ -311,7 +333,7 @@ _START()
 
         ${virsh} start "${vmName}" >/dev/null
 
-        sleep 3
+        sleep 5
 
         for i in 1 2 3 4 5 6 7 8 9 10; do
             local IP=
@@ -322,7 +344,7 @@ _START()
                 continue
             fi
 
-            ssh "${remoteUser}@${IP}" hostname >/dev/null 2>&1
+            ssh -o StrictHostKeyChecking=accept-new "${remoteUser}@${IP}" hostname >/dev/null
 
             if [ $? -eq 0 ]; then
                 _NOTIFY "${vmName} started"
@@ -330,6 +352,8 @@ _START()
                 ${0} mktunnel "${vmName}"
 
                 return
+            else
+                _NOTIFY "Sleep and retry to connect..."
             fi
 
             sleep 3
@@ -357,8 +381,8 @@ _MKTUNNEL()
         return 1
     fi
 
-    local localSocket="${HOME}/homerunos-${tunnelVM}.sock"
-    local remoteSocket="/home/${remoteUser}/homerunos.sock"
+    local localSocket="${HOME}/.homerunos-${tunnelVM}.sock"
+    local remoteSocket="/home/${remoteUser}/.homerunos.sock"
     local pidFile="/tmp/homerunos-${tunnelVM}.pid"
 
     rm -f "${localSocket}"
@@ -413,12 +437,35 @@ _TUNNELFORK()
     local tunnelVMPath=""
     IFS= read -r tunnelVMPath
 
+    local pid=
+
+    (
     # Close stdin as it is unix socket and kdialog reacts to this.
     #
     exec 0<&-
 
-    # TODO: consider separating stout and stderr
-    ${0} "cp" "${sourceVM}" "${sourcePath}" "${tunnelVM}" "${tunnelVMPath}" 2>&1
+    pid=
+    trap "kill -s HUP \$pid" TERM INT HUP
+
+    ${0} "cp" "${sourceVM}" "${sourcePath}" "${tunnelVM}" "${tunnelVMPath}" 2>&1 &
+
+    pid="$!"
+
+    wait "$pid"
+
+    ) &
+
+    pid="$!"
+
+    while kill -0 "${pid}" 2>/dev/null; do
+        # TODO: I'm trying to detect client close but no dice so far...
+        if ! command >&1; then
+            kill -s HUP "${pid}"
+        fi
+        sleep 1
+    done
+
+    wait "${pid}"
 
     err="$?"
 
@@ -515,7 +562,7 @@ _CLONE()
     local vmName="${1}"
     shift
 
-    _ERROR "Cloning ${tpl}..."
+    _NOTIFY "Cloning ${tpl}..."
 
     virt-clone --original "${tpl}" --name "${vmName}" --auto-clone
 
@@ -533,30 +580,9 @@ _CLONE()
         return 1
     fi
 
+    _NOTIFY "Clone is prepared succseefully"
+
     _START "${vmName}" || return 1
-
-    _NOTIFY "Attempting to connect to ${vmName} via SSH..."
-
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-        local IP=
-        IP=$(_IP "${vmName}")
-
-        if [ -z "${IP}" ]; then
-            sleep 3
-            continue
-        fi
-
-        ssh -o StrictHostKeyChecking=accept-new "${remoteUser}@${IP}" hostname >/dev/null
-
-        if [ $? -eq 0 ]; then
-            _ERROR "SSH'ing into the new VM failed. Possibly a confligt in known_hosts. Fix that then run: oo ssh ${vmName}"
-            return
-        fi
-
-        sleep 3
-    done
-
-    _ERROR "Could not SSH into newly cloned VM ${vmName}"
 }
 
 if [ "$(id -u)" = "0" ]; then
@@ -648,7 +674,7 @@ oo vm-down vm-name
 
 # Find out where the VMs qcow2 image file is
 #
-virsh dominfo vm-name
+virsh domstats vm-name
 
 # Then do:
 #

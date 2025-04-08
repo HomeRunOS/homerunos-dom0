@@ -312,6 +312,13 @@ If dom0 user is to have access to USB add user to to both `dialout` and `input` 
 
 Attach/detach USB devices from the virt-manager UI.
 
+### Pipewire
+```sh
+sudo apt install pipewire pipewire-alsa pipewire-jack pipewire-audio wireplumber pipewire-pulse
+systemctl --user --now enable wireplumber.service  # run as user
+```
+
+
 ### Resize images
 1. Shutdown VM  
 2. Move image to img.qcow2.old  
